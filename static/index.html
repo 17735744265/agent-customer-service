@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能售前导购助手</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+        
+        .header { background: #1a1a2e; color: #fff; padding: 16px 24px; font-size: 18px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+        .session-info { font-size: 12px; color: #aaa; }
+        
+        .chat-container { flex: 1; overflow-y: auto; padding: 20px; max-width: 800px; margin: 0 auto; width: 100%; }
+        
+        .message { margin-bottom: 16px; display: flex; }
+        .message.user { justify-content: flex-end; }
+        .message.assistant { justify-content: flex-start; }
+        
+        .bubble { max-width: 70%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+        .message.user .bubble { background: #1a1a2e; color: #fff; border-bottom-right-radius: 4px; }
+        .message.assistant .bubble { background: #fff; color: #333; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        
+        .intent-tag { font-size: 11px; color: #999; margin-top: 4px; }
+        
+        .input-area { background: #fff; border-top: 1px solid #e0e0e0; padding: 16px 24px; }
+        .input-row { max-width: 800px; margin: 0 auto; display: flex; gap: 12px; }
+        .input-row input { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; outline: none; }
+        .input-row input:focus { border-color: #1a1a2e; }
+        .input-row button { padding: 12px 24px; background: #1a1a2e; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
+        .input-row button:hover { background: #2d2d4e; }
+        .input-row button:disabled { background: #999; cursor: not-allowed; }
+        
+        .typing { color: #999; font-size: 13px; padding: 4px 0; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <span>智能售前导购助手</span>
+        <span class="session-info" id="sessionInfo"></span>
+    </div>
+    <div class="chat-container" id="chatContainer">
+        <div class="message assistant">
+            <div class="bubble">你好！我是智能售前导购助手，可以帮你推荐手机、笔记本、平板。告诉我你想买什么？</div>
+        </div>
+    </div>
+    <div class="input-area">
+        <div class="input-row">
+            <input type="text" id="userInput" placeholder="输入你的购物需求..." autofocus />
+            <button id="sendBtn" onclick="sendMessage()">发送</button>
+        </div>
+        <div class="typing" id="typingHint" style="display:none">导购助手正在思考...</div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chatContainer');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const typingHint = document.getElementById('typingHint');
+        const sessionInfo = document.getElementById('sessionInfo');
+
+        // 会话ID：从localStorage恢复，实现刷新后继续对话
+        let sessionId = localStorage.getItem('shopping_session_id') || '';
+        if (sessionId) {
+            sessionInfo.textContent = '会话: ' + sessionId;
+        }
+
+        userInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        function addMessage(role, text, intent) {
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+            let html = `<div class="bubble">${escapeHtml(text)}</div>`;
+            if (intent) {
+                html += `<div class="intent-tag">意图: ${intent}</div>`;
+            }
+            div.innerHTML = html;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function addStreamingBubble() {
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            div.innerHTML = '<div class="bubble"></div>';
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return div.querySelector('.bubble');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text) return;
+
+            addMessage('user', text);
+            userInput.value = '';
+            sendBtn.disabled = true;
+            typingHint.style.display = 'block';
+
+            try {
+                // 使用流式接口（POST方法）
+                const url = `/chat/stream?message=${encodeURIComponent(text)}&session_id=${encodeURIComponent(sessionId)}`;
+                const response = await fetch(url, { method: 'POST' });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let bubble = null;
+                let fullText = '';
+                let currentIntent = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value, { stream: true });
+                    const lines = chunk.split('\n');
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.slice(6);
+
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(data);
+
+                            // 第一帧：保存 session_id
+                            if (parsed.type === 'session' && parsed.session_id) {
+                                sessionId = parsed.session_id;
+                                localStorage.setItem('shopping_session_id', sessionId);
+                                sessionInfo.textContent = '会话: ' + sessionId;
+                            }
+
+                            // 流式内容：逐字追加
+                            if (parsed.content) {
+                                if (!bubble) {
+                                    typingHint.style.display = 'none';
+                                    bubble = addStreamingBubble();
+                                }
+                                fullText += parsed.content;
+                                bubble.textContent = fullText;
+                                chatContainer.scrollTop = chatContainer.scrollHeight;
+                            }
+
+                            // 意图识别结果
+                            if (parsed.type === 'intent') {
+                                currentIntent = parsed.intent;
+                            }
+
+                            // 节点进度
+                            if (parsed.type === 'progress') {
+                                const nodeNames = {
+                                    'understand': '正在理解需求...',
+                                    'search': '正在检索商品...',
+                                    'compare': '正在对比分析...',
+                                    'recommend': '正在生成推荐...',
+                                    'clarify': '正在思考...'
+                                };
+                                if (nodeNames[parsed.node]) {
+                                    typingHint.textContent = nodeNames[parsed.node];
+                                }
+                            }
+                        } catch (e) {
+                            // 非JSON行跳过
+                        }
+                    }
+                }
+
+                // 流式结束后，如果没收到任何内容，回退到普通接口
+                if (!bubble) {
+                    typingHint.textContent = '导购助手正在思考...';
+                    const fallbackResp = await fetch(
+                        `/chat?message=${encodeURIComponent(text)}&session_id=${encodeURIComponent(sessionId)}`,
+                        { method: 'POST' }
+                    );
+                    const fallbackData = await fallbackResp.json();
+                    typingHint.style.display = 'none';
+                    addMessage('assistant', fallbackData.reply, fallbackData.intent);
+                    if (fallbackData.session_id) {
+                        sessionId = fallbackData.session_id;
+                        localStorage.setItem('shopping_session_id', sessionId);
+                        sessionInfo.textContent = '会话: ' + sessionId;
+                    }
+                } else if (currentIntent) {
+                    // 给流式消息加上意图标签
+                    const msgDiv = bubble.closest('.message');
+                    if (msgDiv) {
+                        const tag = document.createElement('div');
+                        tag.className = 'intent-tag';
+                        tag.textContent = '意图: ' + currentIntent;
+                        msgDiv.appendChild(tag);
+                    }
+                }
+
+            } catch (err) {
+                typingHint.style.display = 'none';
+                addMessage('assistant', '抱歉，请求出错了: ' + err.message);
+            } finally {
+                sendBtn.disabled = false;
+                typingHint.style.display = 'none';
+                userInput.focus();
+            }
+        }
+    </script>
+</body>
+</html>
